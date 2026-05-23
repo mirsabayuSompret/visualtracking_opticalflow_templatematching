@@ -1,0 +1,4 @@
+Agreement Metric,Mean Value
+MSE (↓ better),0.0822
+MAE (↓ better),0.1990
+Pearson Corr (↑ better),0.0198
