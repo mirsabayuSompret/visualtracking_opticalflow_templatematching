@@ -7,11 +7,26 @@ The script:
   1. Downloads the dataset from HuggingFace.
   2. Extracts consecutive-frame pairs from every available split.
   3. For each pair computes:
-       • Dense Optical Flow  (Farneback)
-       • Template Matching   (grid-of-patches + NCC sliding search)
+       • Sparse Optical Flow  (Lucas-Kanade, implemented from scratch)
+       • Template Matching    (grid-of-patches + NCC sliding search)
   4. Measures wall-clock time per frame-pair for both methods.
   5. Computes per-frame agreement metrics between the two motion maps.
   6. Visualises everything as heat-maps and saves the figures to ./results/.
+
+Lucas-Kanade implementation notes
+----------------------------------
+The LK optical-flow algorithm assumes brightness constancy and small motion.
+For a pixel (x, y) with local window W it solves the over-determined system
+
+    A · [u, v]^T = b
+
+where each row of A is [Ix, Iy] for a pixel in the window and b[i] = -It[i].
+The least-squares solution is [u, v]^T = (A^T A)^{-1} A^T b.
+
+This implementation:
+  • Uses only NumPy for all mathematical operations.
+  • Uses cv2 only for image-level Gaussian smoothing (image pre-processing).
+  • Applies a multi-scale (image pyramid) strategy so larger motions are captured.
 """
 
 import os
@@ -62,30 +77,246 @@ def resize_gray(img: np.ndarray, max_dim: int = 320) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Algorithm 1 – Farneback Dense Optical Flow
+#  Algorithm 1 – Lucas-Kanade Optical Flow (from scratch, NumPy only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def optical_flow_motion_map(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
+# Sobel kernels (separable form: outer product of these 1-D arrays)
+_SOBEL_SMOOTH = np.array([1, 2, 1], dtype=np.float32)   # smoothing direction
+_SOBEL_DIFF   = np.array([1, 0, -1], dtype=np.float32)  # derivative direction
+
+
+def _convolve2d(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """
-    Returns a normalised (0-1) motion-magnitude map using Farneback optical flow.
+    2-D convolution via direct NumPy sliding-window (no scipy/cv2 math calls).
+    Handles float32 images.  Uses 'reflect' border padding.
+    """
+    kh, kw = kernel.shape
+    ph, pw = kh // 2, kw // 2
+    # Pad image with reflect mode
+    padded = np.pad(img, ((ph, ph), (pw, pw)), mode="reflect")
+    # Build a view with shape (H, W, kh, kw) using stride tricks
+    shape   = img.shape + kernel.shape
+    strides = padded.strides + padded.strides
+    patches = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+    return (patches * kernel).sum(axis=(-2, -1))
+
+
+def _separable_convolve(img: np.ndarray,
+                        k_row: np.ndarray,
+                        k_col: np.ndarray) -> np.ndarray:
+    """
+    Apply two 1-D kernels in sequence (row direction then column direction).
+    Both kernels are 1-D arrays; they are treated as row-vector and
+    column-vector kernels respectively.
+    """
+    # row pass: kernel shape (1, K)
+    tmp = _convolve2d(img, k_row.reshape(1, -1))
+    # col pass: kernel shape (K, 1)
+    return _convolve2d(tmp, k_col.reshape(-1, 1))
+
+
+def _spatial_gradient_x(img: np.ndarray) -> np.ndarray:
+    """Horizontal Sobel derivative  ∂I/∂x."""
+    return _separable_convolve(img, _SOBEL_DIFF, _SOBEL_SMOOTH)
+
+
+def _spatial_gradient_y(img: np.ndarray) -> np.ndarray:
+    """Vertical Sobel derivative  ∂I/∂y."""
+    return _separable_convolve(img, _SOBEL_SMOOTH, _SOBEL_DIFF)
+
+
+def _gaussian_kernel_1d(sigma: float, radius: int) -> np.ndarray:
+    """1-D Gaussian kernel (normalised)."""
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    g = np.exp(-0.5 * (x / sigma) ** 2)
+    return g / g.sum()
+
+
+def _gaussian_blur(img: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """
+    Separable Gaussian blur implemented with NumPy convolutions.
+    cv2.GaussianBlur is NOT used here.
+    """
+    radius = max(1, int(3 * sigma))
+    k = _gaussian_kernel_1d(sigma, radius)
+    return _separable_convolve(img, k, k)
+
+
+def _lk_flow_single_scale(
+    prev: np.ndarray,
+    curr: np.ndarray,
+    win_half: int = 7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Lucas-Kanade optical flow for every pixel in a *single* scale.
 
     Parameters
     ----------
-    prev, curr : uint8 grayscale frames
+    prev, curr  : float32 grayscale images of the same shape
+    win_half    : half-size of the integration window (window = (2w+1)×(2w+1))
+
+    Returns
+    -------
+    u, v : float32 arrays of horizontal / vertical flow (same shape as input)
     """
-    flow = cv2.calcOpticalFlowFarneback(
-        prev, curr,
-        None,
-        pyr_scale=0.5,
-        levels=3,
-        winsize=15,
-        iterations=3,
-        poly_n=5,
-        poly_sigma=1.2,
-        flags=0,
+    h, w = prev.shape
+
+    # Spatial gradients from the average of the two frames (more stable)
+    avg = (prev + curr) * 0.5
+    Ix = _spatial_gradient_x(avg)
+    Iy = _spatial_gradient_y(avg)
+    It = curr.astype(np.float32) - prev.astype(np.float32)   # temporal gradient
+
+    # Pre-compute element-wise products
+    Ixx = Ix * Ix
+    Iyy = Iy * Iy
+    Ixy = Ix * Iy
+    Ixt = Ix * It
+    Iyt = Iy * It
+
+    # Box-filter (sliding window sum) for each product
+    # Implemented as two 1-D uniform-kernel separable convolutions
+    win = 2 * win_half + 1
+    box_k = np.ones(win, dtype=np.float32)
+
+    def _box(arr: np.ndarray) -> np.ndarray:
+        return _separable_convolve(arr, box_k, box_k)
+
+    sIxx = _box(Ixx)
+    sIyy = _box(Iyy)
+    sIxy = _box(Ixy)
+    sIxt = _box(Ixt)
+    sIyt = _box(Iyt)
+
+    # Solve A^T A [u,v]^T = -A^T b  (Cramer's rule)
+    det = sIxx * sIyy - sIxy * sIxy
+    # Avoid division by (near-)zero: mask out unreliable pixels
+    mask = np.abs(det) > 1e-6
+
+    u = np.zeros((h, w), dtype=np.float32)
+    v = np.zeros((h, w), dtype=np.float32)
+
+    u[mask] = (-sIxt[mask] * sIyy[mask] + sIyt[mask] * sIxy[mask]) / det[mask]
+    v[mask] = (-sIyt[mask] * sIxx[mask] + sIxt[mask] * sIxy[mask]) / det[mask]
+
+    return u, v
+
+
+def _downsample(img: np.ndarray) -> np.ndarray:
+    """Halve the image size using simple 2×2 average pooling (NumPy only)."""
+    h, w = img.shape
+    h2, w2 = h // 2, w // 2
+    return 0.25 * (
+        img[:h2*2:2, :w2*2:2]
+        + img[1:h2*2:2, :w2*2:2]
+        + img[:h2*2:2, 1:w2*2:2]
+        + img[1:h2*2:2, 1:w2*2:2]
     )
-    magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    # normalise to [0, 1]
+
+
+def _upsample(flow: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """
+    Nearest-neighbour upsampling to (target_h, target_w) using NumPy index tricks.
+    The flow values are scaled by 2 to account for the resolution doubling.
+    """
+    h, w = flow.shape
+    scale_y = target_h / h
+    scale_x = target_w / w
+    yi = np.clip((np.arange(target_h) / scale_y).astype(int), 0, h - 1)
+    xi = np.clip((np.arange(target_w) / scale_x).astype(int), 0, w - 1)
+    return flow[np.ix_(yi, xi)] * 2.0
+
+
+def _warp_frame(frame: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """
+    Warp *frame* by the flow field (u, v) using bilinear interpolation (NumPy).
+    Each destination pixel (y, x) is sampled from source (y+v, x+u).
+    """
+    h, w = frame.shape
+    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32),
+                         np.arange(w, dtype=np.float32), indexing="ij")
+    # Source coordinates
+    src_y = np.clip(yy + v, 0, h - 1)
+    src_x = np.clip(xx + u, 0, w - 1)
+
+    # Bilinear interpolation
+    y0 = src_y.astype(int)
+    x0 = src_x.astype(int)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+
+    fy = src_y - y0
+    fx = src_x - x0
+
+    warped = (
+        frame[y0, x0] * (1 - fy) * (1 - fx)
+        + frame[y1, x0] * fy       * (1 - fx)
+        + frame[y0, x1] * (1 - fy) * fx
+        + frame[y1, x1] * fy       * fx
+    )
+    return warped.astype(np.float32)
+
+
+# Lucas-Kanade hyper-parameters
+LK_LEVELS   = 3     # number of pyramid levels
+LK_WIN_HALF = 7     # integration window half-size at each level
+LK_SIGMA    = 1.0   # Gaussian pre-blur sigma
+
+
+def optical_flow_motion_map(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
+    """
+    Compute a normalised (0-1) motion-magnitude map using a from-scratch
+    multi-scale Lucas-Kanade optical flow algorithm.
+
+    Only NumPy is used for all mathematical operations.
+    cv2 is NOT called anywhere in this function or its helpers.
+
+    Parameters
+    ----------
+    prev, curr : uint8 grayscale frames (same shape)
+
+    Returns
+    -------
+    magnitude : float32 array in [0, 1], same spatial shape as input
+    """
+    # Convert to float32 and pre-blur (NumPy Gaussian, not cv2)
+    p = _gaussian_blur(prev.astype(np.float32), LK_SIGMA)
+    c = _gaussian_blur(curr.astype(np.float32), LK_SIGMA)
+
+    # Build Gaussian pyramids (coarse → fine order stored as list[0]=finest)
+    pyr_p: list[np.ndarray] = [p]
+    pyr_c: list[np.ndarray] = [c]
+    for _ in range(LK_LEVELS - 1):
+        pyr_p.append(_downsample(pyr_p[-1]))
+        pyr_c.append(_downsample(pyr_c[-1]))
+
+    # Initialise flow at coarsest scale
+    coarse_p = pyr_p[-1]
+    h0, w0 = coarse_p.shape
+    u = np.zeros((h0, w0), dtype=np.float32)
+    v = np.zeros((h0, w0), dtype=np.float32)
+
+    # Coarse-to-fine refinement
+    for level in range(LK_LEVELS - 1, -1, -1):
+        lp = pyr_p[level]
+        lc = pyr_c[level]
+        lh, lw = lp.shape
+
+        # Upsample flow estimate from coarser level (skip for coarsest)
+        if level < LK_LEVELS - 1:
+            u = _upsample(u, lh, lw)
+            v = _upsample(v, lh, lw)
+
+        # Warp current frame by current flow estimate
+        warped_c = _warp_frame(lc, u, v)
+
+        # Refine residual flow
+        du, dv = _lk_flow_single_scale(lp, warped_c, win_half=LK_WIN_HALF)
+        u = u + du
+        v = v + dv
+
+    # Motion magnitude
+    magnitude = np.sqrt(u ** 2 + v ** 2)
     mag_max = magnitude.max()
     if mag_max > 0:
         magnitude /= mag_max
@@ -211,7 +442,7 @@ def save_pair_heatmap(
     axes[1].set_title("Frame N+1 (curr)", fontsize=9)
 
     im2 = axes[2].imshow(of_map, cmap=CMAP_OF, vmin=0, vmax=1)
-    axes[2].set_title("Optical Flow\n(motion magnitude)", fontsize=9)
+    axes[2].set_title("Lucas-Kanade Optical Flow\n(motion magnitude)", fontsize=9)
     plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
     im3 = axes[3].imshow(tm_map, cmap=CMAP_TM, vmin=0, vmax=1)
@@ -249,7 +480,7 @@ def save_summary_heatmaps(
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     im0 = axes[0].imshow(mean_of_map, cmap=CMAP_OF, vmin=0, vmax=1)
-    axes[0].set_title("Average Optical Flow\nMotion Magnitude", fontsize=10)
+    axes[0].set_title("Average Lucas-Kanade Optical Flow\nMotion Magnitude", fontsize=10)
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
     im1 = axes[1].imshow(mean_tm_map, cmap=CMAP_TM, vmin=0, vmax=1)
@@ -286,7 +517,7 @@ def save_summary_heatmaps(
         for spine in ["top", "right"]:
             ax.spines[spine].set_visible(False)
 
-    fig.suptitle("Agreement Metrics – Optical Flow vs Template Matching\n"
+    fig.suptitle("Agreement Metrics – Lucas-Kanade Optical Flow vs Template Matching\n"
                  "(computed per frame pair, averaged over all pairs)", fontsize=11)
     plt.tight_layout()
     fig.savefig(out_dir / "summary_metrics.png", dpi=130, bbox_inches="tight")
