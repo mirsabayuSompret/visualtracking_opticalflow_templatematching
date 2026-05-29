@@ -64,7 +64,7 @@ class preprocessor:
         
         limit     = (max_pairs + 1) if max_pairs else len(img_files)
         img_files = img_files[:limit]
-        print(f"  → Found {len(img_files)} image file(s) – building frame pairs …")
+        print(f"  → Found {len(img_files)} image file(s) building frame pairs …")
 
         gray_frames : list[np.ndarray] = []
         rgb_frames : list[np.ndarray] = []

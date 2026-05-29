@@ -1,4 +1,0 @@
-Metric,Optical Flow,Template Matching
-Avg processing time (ms),23.62,3.40
-Avg motion coverage,0.4401,0.2343
-Avg motion intensity (mean map value),0.1410,0.1304

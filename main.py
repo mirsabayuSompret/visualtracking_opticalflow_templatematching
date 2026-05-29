@@ -1,6 +1,5 @@
 
 from dataset_loader import DataLoader, preprocessor
-from detector import background_subtractor, yolo_detector
 from feature_extractor import optical_flow, template_matching
 from visualization import visualization
 import cv2
@@ -18,24 +17,23 @@ class Main:
         ds_preprocessed = prep.convertToGrayScaleAndResize(ds)
         print(f"Preprocessed dataset with {len(ds_preprocessed)} frame pairs.")
 
-        detector = yolo_detector()
-        # only give first frame pair for detecting using YOLO, 
-        # because it is not a tracking algorithm, 
-        # it is a detection algorithm. 
-        # We will use the detected bounding box as the template for 
-        # template matching in the next step.
-        ds_gray_frame_pair = [(frame_pair[0], frame_pair[1]) for frame_pair in ds_preprocessed][0]
-        ds_detected = detector.detect(ds_gray_frame_pair)
         
-        # feature_extractor = optical_flow()
-        # ds_features = feature_extractor.extract(ds_detected)
+        ds_images = []
+        for frame_pair in ds_preprocessed:
+            ds_images.append((frame_pair[0], frame_pair[1]))
 
-        # visualizer = visualization(ds_detected)
-        # visualizer.produce_heatmap(ds_features)
-        # visualizer.produce_trajectory(ds_features)
-        # visualizer.produce_combined_visualization(ds_features)
-        # visualizer.produce_bounding_boxes(ds_features)
+        print(f"length of ds_images: {len(ds_images)}")
 
+        of_extractor = optical_flow()
+        optical_flow_features = of_extractor.extract_features(ds_images)
+
+        visualizer = visualization()
+        visualizer.produce_bounding_boxes(ds, optical_flow_features)
+
+        # print("Extracted optical flow features for the first frame pair.")
+        # print(f"Feature shape: {len(features[0])}x{len(features[0][0])}")
+        
+        
 if __name__ == "__main__":
     print("Starting main program...")
     Main()

@@ -1,34 +1,3 @@
-"""
-Optical Flow vs Template Matching – Performance Comparison
-==========================================================
-Dataset : maxwinkelmann/kite-tracking  (Kaggle – image sequence)
-
-The script:
-  1. Downloads the dataset from Kaggle.
-  2. Reads frames in sorted filename order.
-  3. For each consecutive pair computes:
-       • Sparse Optical Flow  (Lucas-Kanade, implemented from scratch)
-       • Template Matching    (grid-of-patches + NCC sliding search)
-  4. Measures wall-clock time per frame-pair for both methods.
-  5. Computes per-frame agreement metrics between the two motion maps.
-  6. Visualises everything as heat-maps and saves the figures to ./results/.
-
-Lucas-Kanade implementation notes
-----------------------------------
-The LK optical-flow algorithm assumes brightness constancy and small motion.
-For a pixel (x, y) with local window W it solves the over-determined system
-
-    A · [u, v]^T = b
-
-where each row of A is [Ix, Iy] for a pixel in the window and b[i] = -It[i].
-The least-squares solution is [u, v]^T = (A^T A)^{-1} A^T b.
-
-This implementation:
-  • Uses only NumPy for all mathematical operations.
-  • Uses cv2 only for image-level Gaussian smoothing (image pre-processing).
-  • Applies a multi-scale (image pyramid) strategy so larger motions are captured.
-"""
-
 import os
 import time
 import warnings
@@ -48,14 +17,20 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────── configuration ────────────────────────────────
-KAGGLE_DATASET = "maxwinkelmann/kite-tracking"   # <owner>/<dataset-slug>
-KAGGLE_DIR     = Path(r"D:\.cache\kaggle\kite-tracking")  # local download dir
 MAX_PAIRS      = None        # None → process every frame in the dataset
 RESULT_EVERY   = 10          # save visualisations for every Nth pair
 GRID_ROWS      = 8           # template-matching grid rows
 GRID_COLS      = 8           # template-matching grid cols
-SEARCH_MARGIN  = 20          # pixels around each patch to search
+SEARCH_MARGIN  = 16          # pixels around each patch to search
 RESULTS_DIR    = Path("results")
+LK_LEVELS      = 3 
+LK_WIN_HALF    = 7
+LK_SIGMA       = 1.0
+# Ignore optical-flow magnitudes smaller than this (normalized [0,1])
+OF_MIN_FLOW_THRESHOLD = 0.1
+# Ignore bounding boxes smaller than these dimensions (pixels)
+BBOX_MIN_WIDTH = 16
+BBOX_MIN_HEIGHT = 16
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -161,7 +136,7 @@ def _warp_frame(frame, u, v):
           + frame[y0,x1]*(1-fy)*fx     + frame[y1,x1]*fy*fx).astype(np.float32)
 
 
-LK_LEVELS = 3; LK_WIN_HALF = 7; LK_SIGMA = 1.0
+
 
 
 def optical_flow_motion_map(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
@@ -182,8 +157,15 @@ def optical_flow_motion_map(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
         du, dv = _lk_flow_single_scale(lp, warped_c, win_half=LK_WIN_HALF)
         u += du; v += dv
     magnitude = np.sqrt(u**2 + v**2)
+    # Zero-out very small motions (ignore weak features)
+    try:
+        threshold = OF_MIN_FLOW_THRESHOLD
+    except NameError:
+        threshold = 0.05
+    magnitude[magnitude < threshold] = 0.0
     mag_max = magnitude.max()
-    if mag_max > 0: magnitude /= mag_max
+    if mag_max > 0:
+        magnitude /= mag_max
     return magnitude.astype(np.float32)
 
 
@@ -240,7 +222,7 @@ def compute_metrics(of_map: np.ndarray, tm_map: np.ndarray) -> dict:
 CMAP_OF = "hot"; CMAP_TM = "cool"; CMAP_DIFF = "RdBu"
 
 
-def save_pair_heatmap(prev_frame, curr_frame, of_map, tm_map, pair_idx, out_dir):
+def save_pair_heatmap(prev_frame, curr_frame, of_map, tm_map, pair_idx, out_dir, filename_prefix="movement"):
     fig, axes = plt.subplots(1, 5, figsize=(22, 4))
     axes[0].imshow(prev_frame, cmap="gray"); axes[0].set_title("Frame N (prev)", fontsize=9)
     axes[1].imshow(curr_frame, cmap="gray"); axes[1].set_title("Frame N+1 (curr)", fontsize=9)
@@ -257,11 +239,11 @@ def save_pair_heatmap(prev_frame, curr_frame, of_map, tm_map, pair_idx, out_dir)
     for ax in axes: ax.axis("off")
     fig.suptitle(f"Frame pair {pair_idx:03d}", fontsize=11, y=1.01)
     plt.tight_layout()
-    fig.savefig(out_dir / f"pair_{pair_idx:03d}.png", dpi=110, bbox_inches="tight")
+    fig.savefig(out_dir / f"pair_{filename_prefix}_{pair_idx:03d}.png", dpi=110, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
+def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir, name_prefix="summary"):
     # Average heat-maps
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     im0 = axes[0].imshow(mean_of_map, cmap=CMAP_OF, vmin=0, vmax=1)
@@ -276,7 +258,7 @@ def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
     plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
     for ax in axes: ax.axis("off")
     plt.tight_layout()
-    fig.savefig(out_dir / "summary_average_heatmaps.png", dpi=130, bbox_inches="tight")
+    fig.savefig(out_dir / f"summary_{name_prefix}_average_heatmaps.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     # Metric bar chart
@@ -295,7 +277,7 @@ def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
         for s in ["top", "right"]: ax.spines[s].set_visible(False)
     fig.suptitle("Agreement Metrics – Lucas-Kanade Optical Flow vs Template Matching", fontsize=11)
     plt.tight_layout()
-    fig.savefig(out_dir / "summary_metrics.png", dpi=130, bbox_inches="tight")
+    fig.savefig(out_dir / f"summary_{name_prefix}_metrics.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     # Timing
@@ -309,7 +291,7 @@ def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
     ax.set_title("Processing Time per Frame Pair"); ax.legend()
     for s in ["top", "right"]: ax.spines[s].set_visible(False)
     plt.tight_layout()
-    fig.savefig(out_dir / "summary_timing.png", dpi=130, bbox_inches="tight")
+    fig.savefig(out_dir / f"summary_{name_prefix}_timing.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     # Correlation line chart
@@ -323,7 +305,7 @@ def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
     ax.legend()
     for s in ["top", "right"]: ax.spines[s].set_visible(False)
     plt.tight_layout()
-    fig.savefig(out_dir / "summary_correlation.png", dpi=130, bbox_inches="tight")
+    fig.savefig(out_dir / f"summary_{name_prefix}_correlation.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     # Motion coverage
@@ -343,11 +325,11 @@ def save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, out_dir):
     axes[1].set_ylabel("Mean motion coverage"); axes[1].set_title("Average Motion Coverage\nper Algorithm")
     for s in ["top", "right"]: axes[1].spines[s].set_visible(False)
     plt.tight_layout()
-    fig.savefig(out_dir / "summary_motion_coverage.png", dpi=130, bbox_inches="tight")
+    fig.savefig(out_dir / f"summary_{name_prefix}_motion_coverage.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_performance_table(results_df: pd.DataFrame, out_dir: Path) -> None:
+def save_performance_table(results_df: pd.DataFrame, out_dir: Path, name_prefix: str = "summary") -> None:
     summary = pd.DataFrame({
         "Metric": ["Avg processing time (ms)", "Avg motion coverage",
                    "Avg motion intensity (mean map value)"],
@@ -375,9 +357,9 @@ def save_performance_table(results_df: pd.DataFrame, out_dir: Path) -> None:
     print("\n" + "─"*58 + "\n  AGREEMENT BETWEEN ALGORITHMS\n" + "─"*58)
     print(agreement.to_string(index=False))
     print("═"*58 + "\n")
-    summary.to_csv(out_dir / "performance_summary.csv", index=False)
-    agreement.to_csv(out_dir / "agreement_metrics.csv", index=False)
-    results_df.to_csv(out_dir / "per_pair_results.csv", index=False)
+    summary.to_csv(out_dir / f"summary_{name_prefix}_performance.csv", index=False)
+    agreement.to_csv(out_dir / f"summary_{name_prefix}_agreement.csv", index=False)
+    results_df.to_csv(out_dir / f"summary_{name_prefix}_per_pair_results.csv", index=False)
     print(f"Tables saved to {out_dir}/")
 
 
@@ -517,6 +499,55 @@ def load_frame_pairs(max_pairs: int | None = MAX_PAIRS):
     print(f"  → {len(pairs)} consecutive frame-pair(s) prepared.")
     return pairs
 
+def load_frame_pairs_from_video(video_path: Path, max_pairs: int | None = MAX_PAIRS) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Load frames from a video file, convert to grayscale, and return a list of
+    (prev_gray, curr_gray) pairs ready for algorithm processing.
+    """
+    if not video_path.is_file():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video file: {video_path}")
+
+    orig_frames: list[np.ndarray] = []
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        orig_frames.append(frame)
+        gray = resize_gray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # # Apply Otsu's thresholding for segmentation
+        # _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # # Remove noise with morphological operations
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        # # Apply blob filtering to remove small noise blobs
+        # contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # min_blob_area = 30
+        # for contour in contours:
+        #     if cv2.contourArea(contour) < min_blob_area:
+        #         cv2.drawContours(binary, [contour], 0, 0, -1)
+        
+        frames.append(gray)
+        if max_pairs and len(frames) >= max_pairs + 1:
+            break
+
+    cap.release()
+    if len(frames) < 2:
+        raise RuntimeError("Fewer than 2 frames could be loaded from the video.")
+
+    
+    pairs = [(frames[i], frames[i + 1], orig_frames[i + 1]) for i in range(len(frames) - 1)]
+    print(f"Loaded {len(pairs)} frame pairs from video.")
+    return pairs
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bounding Box Visualisation
@@ -527,6 +558,7 @@ def draw_motion_bounding_boxes(
     motion_map: np.ndarray,
     threshold: float = 0.2,
     min_area: int = 100,
+    min_bbox_size: tuple = (BBOX_MIN_WIDTH, BBOX_MIN_HEIGHT),
     color: tuple = (0, 255, 0),
     label: str = "",
 ) -> np.ndarray:
@@ -567,14 +599,76 @@ def draw_motion_bounding_boxes(
 
     # Find contours and draw bounding boxes
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_w, min_h = min_bbox_size
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
         x, y, w, h = cv2.boundingRect(cnt)
+        if area < min_area or w < min_w or h < min_h:
+            continue
         cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
         if label:
             cv2.putText(vis, label, (x, max(y - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    return vis
+
+
+def draw_average_bounding_box(
+    frame: np.ndarray,
+    motion_map: np.ndarray,
+    threshold: float = 0.2,
+    color: tuple = (0, 0, 255),
+    label: str = "",
+    min_area: int = 50,
+    min_bbox_size: tuple = (BBOX_MIN_WIDTH, BBOX_MIN_HEIGHT),
+) -> np.ndarray:
+    """
+    Draw a single average bounding box encompassing all motion regions.
+    """
+    if frame.ndim == 2:
+        vis = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    else:
+        vis = frame.copy()
+
+    # Resize motion map to match the frame if needed
+    if motion_map.shape != frame.shape[:2]:
+        motion_map = cv2.resize(motion_map, (frame.shape[1], frame.shape[0]),
+                                interpolation=cv2.INTER_LINEAR)
+
+    # Threshold → binary mask
+    binary = (motion_map > threshold).astype(np.uint8) * 255
+
+    # Morphological operations to merge nearby blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    binary = cv2.dilate(binary, kernel, iterations=2)
+    binary = cv2.erode(binary, kernel, iterations=1)
+
+    # Find contours and collect bounding boxes
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+        min_w, min_h = min_bbox_size
+        if area < min_area or w < min_w or h < min_h:
+            continue
+        boxes.append((x, y, w, h))
+
+    # Draw average bounding box if boxes exist
+    if boxes:
+        x_coords = [box[0] for box in boxes]
+        y_coords = [box[1] for box in boxes]
+        w_coords = [box[2] for box in boxes]
+        h_coords = [box[3] for box in boxes]
+        
+        avg_x = int(np.mean(x_coords))
+        avg_y = int(np.mean(y_coords))
+        avg_w = int(np.mean(w_coords))
+        avg_h = int(np.mean(h_coords))
+        
+        cv2.rectangle(vis, (avg_x, avg_y), (avg_x + avg_w, avg_y + avg_h), color, 2)
+        if label:
+            cv2.putText(vis, label, (avg_x, max(avg_y - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     return vis
@@ -589,6 +683,7 @@ def save_bounding_box_visualization(
     pair_idx: int,
     out_dir: Path,
     threshold: float = 0.2,
+    name_prefix: str = "bbox",
 ) -> None:
     """
     Save a 5-panel figure showing:
@@ -598,48 +693,64 @@ def save_bounding_box_visualization(
       • Preprocessed frame + Template Matching bounding boxes  (yellow)
       • Preprocessed frame + BOTH sets of boxes combined
     """
+
     of_vis = draw_motion_bounding_boxes(
         curr_frame, of_map, threshold=threshold, color=(0, 255, 0),   label="OF")
     tm_vis = draw_motion_bounding_boxes(
         curr_frame, tm_map, threshold=threshold, color=(0, 200, 255), label="TM")
+    
+    # Average bounding boxes in red
+    of_avg = draw_average_bounding_box(
+        curr_frame, of_map, threshold=threshold, color=(0, 0, 255), label="OF_AVG")
+    tm_avg = draw_average_bounding_box(
+        curr_frame, tm_map, threshold=threshold, color=(0, 0, 255), label="TM_AVG")
 
-    # Combined: TM boxes first, then OF on top
+    # Combined: TM boxes first, then OF on top, then averages
     combined = draw_motion_bounding_boxes(
         curr_frame, tm_map, threshold=threshold, color=(0, 200, 255), label="TM")
     combined = draw_motion_bounding_boxes(
         combined,   of_map, threshold=threshold, color=(0, 255, 0),   label="OF")
+    combined = draw_average_bounding_box(
+        combined, tm_map, threshold=threshold, color=(0, 0, 255), label="TM_AVG")
+    combined = draw_average_bounding_box(
+        combined, of_map, threshold=threshold, color=(0, 0, 255), label="OF_AVG")
 
-    fig, axes = plt.subplots(1, 5, figsize=(30, 5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
     # Panel 0 – raw original (no preprocessing)
-    axes[0].imshow(curr_orig)  # always RGB
-    axes[0].set_title("Original Frame\n(no preprocessing / segmentation)", fontsize=10)
+    axes[0, 0].imshow(curr_orig)  # always RGB
+    axes[0, 0].set_title("Original Frame\n(no preprocessing / segmentation)", fontsize=10)
 
     # Panel 1 – preprocessed gray (resized, what the algorithms see)
-    axes[1].imshow(curr_frame, cmap="gray")
-    axes[1].set_title("Preprocessed Frame\n(grayscale + resized)", fontsize=10)
+    axes[0, 1].imshow(curr_frame, cmap="gray")
+    axes[0, 1].set_title("Preprocessed Framed)", fontsize=10)
 
     # Panel 2 – OF boxes on preprocessed
-    axes[2].imshow(cv2.cvtColor(of_vis, cv2.COLOR_BGR2RGB))
-    axes[2].set_title("Lucas-Kanade Optical Flow\nBounding Boxes (green)", fontsize=10)
+    axes[0, 2].imshow(cv2.cvtColor(of_vis, cv2.COLOR_BGR2RGB))
+    axes[0, 2].set_title("Lucas-Kanade Optical Flow\nBounding Boxes (green)", fontsize=10)
 
     # Panel 3 – TM boxes on preprocessed
-    axes[3].imshow(cv2.cvtColor(tm_vis, cv2.COLOR_BGR2RGB))
-    axes[3].set_title("Template Matching\nBounding Boxes (yellow)", fontsize=10)
+    axes[1, 0].imshow(cv2.cvtColor(tm_vis, cv2.COLOR_BGR2RGB))
+    axes[1, 0].set_title("Template Matching\nBounding Boxes (yellow)", fontsize=10)
+    
+    # Panel 4 – OF average box in red
+    axes[1, 1].imshow(cv2.cvtColor(of_avg, cv2.COLOR_BGR2RGB))
+    axes[1, 1].set_title("OF Average Bounding Box\n(red)", fontsize=10)
+    
+    # Panel 5 – TM average box in red
+    axes[1, 2].imshow(cv2.cvtColor(tm_avg, cv2.COLOR_BGR2RGB))
+    axes[1, 2].set_title("TM Average Bounding Box\n(red)", fontsize=10)
 
-    # Panel 4 – both overlaid
-    axes[4].imshow(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB))
-    axes[4].set_title("Combined\nOF (green)  +  TM (yellow)", fontsize=10)
-
-    for ax in axes:
-        ax.axis("off")
+    for ax_row in axes:
+        for ax in ax_row:
+            ax.axis("off")
 
     fig.suptitle(f"Motion Bounding Boxes – pair {pair_idx:03d}", fontsize=12, y=1.01)
     plt.tight_layout()
 
     bbox_dir = out_dir / "bounding_boxes"
     bbox_dir.mkdir(exist_ok=True)
-    fig.savefig(bbox_dir / f"bbox_{pair_idx:03d}.png", dpi=110, bbox_inches="tight")
+    fig.savefig(bbox_dir / f"bbox_{name_prefix}_{pair_idx:03d}.png", dpi=110, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -650,7 +761,9 @@ def main():
     pairs_dir = RESULTS_DIR / "pairs"
     pairs_dir.mkdir(exist_ok=True)
 
-    pairs = load_frame_pairs(MAX_PAIRS)
+    video_name = "no_movement"
+    video_path = Path(f"assets/{video_name}.mp4")  # <-- Set your video path here
+    pairs = load_frame_pairs_from_video(video_path, max_pairs=MAX_PAIRS)
 
     records      = []
     of_maps_all  = []
@@ -689,10 +802,10 @@ def main():
 
         # ── Per-pair heat-map figure (every RESULT_EVERY pairs) ──────────────
         if idx % RESULT_EVERY == 0:
-            save_pair_heatmap(prev, curr, of_map, tm_map, idx, pairs_dir)
+            save_pair_heatmap(prev, curr, of_map, tm_map, idx, pairs_dir, filename_prefix=video_name)
 
             # ── Bounding box visualisation ────────────────────────────────────
-            save_bounding_box_visualization(prev, curr, curr_orig, of_map, tm_map, idx, RESULTS_DIR)
+            save_bounding_box_visualization(prev, curr, curr_orig, of_map, tm_map, idx, RESULTS_DIR, threshold=0.2, name_prefix=video_name)
 
     results_df = pd.DataFrame(records)
 
@@ -709,8 +822,8 @@ def main():
 
     # ── Summary figures ───────────────────────────────────────────────────────
     print("\nGenerating summary visualisations …")
-    save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, RESULTS_DIR)
-    save_performance_table(results_df, RESULTS_DIR)
+    save_summary_heatmaps(results_df, mean_of_map, mean_tm_map, RESULTS_DIR, name_prefix=video_name)
+    save_performance_table(results_df, RESULTS_DIR, name_prefix=video_name)
 
     print(f"\nAll results saved to: {RESULTS_DIR.resolve()}/")
     print("Files:")

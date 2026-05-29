@@ -14,10 +14,10 @@ class visualization:
         print("Producing trajectory from features...")
         pass
 
-    def produce_combined_visualization(self, features):
+    def produce_combined_visualization(self,images, features):
         print("Producing combined visualization from features...")
         pass
 
-    def produce_bounding_boxes(self, features):
+    def produce_bounding_boxes(self, images, features):
         print("Producing bounding boxes from features...")
         pass
